@@ -1,136 +1,306 @@
-/*
-  Two LM393 mic modules -> limited adaptive noise reduction demo
-  Board: ESP32 (Arduino core)
+#include "BluetoothA2DPSource.h"
+#include "driver/i2s.h"
+#include <math.h>
 
-  IMPORTANT:
-  - Use AO pins only
-  - DO pins are NOT used
-  - This is NOT true ANC and NOT real beamforming
-  - It is a simple adaptive noise-reduction experiment
+BluetoothA2DPSource a2dp_source;
+const char *speaker_name = "Airdopes 411ANC";
 
-  Mic 1 = "signal mic" (near mouth / desired sound)
-  Mic 2 = "noise mic"  (captures ambient noise)
+// ---------------- I2S MIC PINS ----------------
+#define I2S_PORT I2S_NUM_0
+#define I2S_WS   25
+#define I2S_SCK  26
+#define I2S_SD   33
 
-  Serial Plotter output:
-  rawSignal rawNoise cleaned
+// If L/R pin is connected to GND, use ONLY_LEFT
+// If L/R pin is connected to 3.3V, change this to ONLY_RIGHT
+#define MIC_CHANNEL_FORMAT I2S_CHANNEL_FMT_ONLY_LEFT
 
-  Optional:
-  On classic ESP32 boards, you can enable DAC output on GPIO25.
-*/
+// ---------------- AUDIO BUFFER ----------------
+const int BUFFER_SIZE = 16384;
+volatile int16_t sampleBuffer[BUFFER_SIZE];
+volatile int writeIndex = 0;
+volatile int readIndex  = 0;
 
-#define MIC_SIGNAL_PIN 34
-#define MIC_NOISE_PIN  35
+// ---------------- USER TUNING ----------------
+// Input level
+float micGain = 11.5f;
+int noiseGate = 10;
 
-// Set to 1 only on classic ESP32 boards that support dacWrite(GPIO25/26)
-#define USE_DAC_OUTPUT 1
-#define DAC_PIN 25
+// Cinematic tone
+float rumbleCutHz   = 75.0f;    // removes boom/handling noise
+float bassCutoffHz  = 150.0f;   // low body
+float mudCutoffHz   = 320.0f;   // reduce boxiness
+float presenceHz    = 1800.0f;  // bring clarity
 
-const uint32_t SAMPLE_RATE = 8000;
-const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_RATE;
+float bassBoost     = 0.55f;    // 0.35..0.75
+float mudCut        = 0.22f;    // 0.10..0.35
+float presenceBoost = 0.16f;    // 0.08..0.24
 
-const int TAPS = 16;          // adaptive filter length
-float w[TAPS];
-float xHist[TAPS];
+// Harmonics
+float evenDrive = 1.35f;        // 2nd harmonic drive
+float evenMix   = 0.16f;        // warmth
 
-float dcSignal = 2048.0f;
-float dcNoise  = 2048.0f;
-const float DC_ALPHA = 0.002f;
+float oddMix    = 0.14f;        // 3rd harmonic density
+float finalDrive = 1.20f;       // final saturation / seriousness
 
-// Adaptive speed.
-// If unstable/noisy, reduce MU.
-// If effect is too weak, increase MU slightly.
-const float MU   = 0.25f;
-const float LEAK = 0.9999f;
+// Compression
+float compThreshold = 0.26f;    // lower = more compression
+float compRatio     = 2.8f;     // 2.0..4.0
+float compAttack    = 0.08f;
+float compRelease   = 0.003f;
 
-void setup() {
-  Serial.begin(921600);
+float outputGain    = 1.05f;    // final level
 
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);  // wider input range
+// ---------------- DSP STATE ----------------
+float bassLP = 0.0f;
+float mudLP  = 0.0f;
+float presLP = 0.0f;
 
-  pinMode(MIC_SIGNAL_PIN, INPUT);
-  pinMode(MIC_NOISE_PIN, INPUT);
+float bassAlpha = 0.0f;
+float mudAlpha  = 0.0f;
+float presAlpha = 0.0f;
 
-#if USE_DAC_OUTPUT
-  pinMode(DAC_PIN, OUTPUT);
-#endif
+// High-pass (rumble cut) state
+float hp_x1 = 0.0f;
+float hp_y1 = 0.0f;
+float hpA   = 0.0f;
 
-  for (int i = 0; i < TAPS; i++) {
-    w[i] = 0.0f;
-    xHist[i] = 0.0f;
+// DC blockers
+float dc1_x1 = 0.0f, dc1_y1 = 0.0f;
+float dc2_x1 = 0.0f, dc2_y1 = 0.0f;
+const float dcR = 0.995f;
+
+// Compressor envelope
+float compEnv = 0.0f;
+
+void pushSample(int16_t s) {
+  int next = (writeIndex + 1) % BUFFER_SIZE;
+  if (next != readIndex) {
+    sampleBuffer[writeIndex] = s;
+    writeIndex = next;
+  }
+}
+
+int16_t popSample() {
+  if (readIndex == writeIndex) return 0;
+  int16_t s = sampleBuffer[readIndex];
+  readIndex = (readIndex + 1) % BUFFER_SIZE;
+  return s;
+}
+
+float onePoleAlpha(float cutoffHz, float fs) {
+  return (2.0f * PI * cutoffHz) / (fs + 2.0f * PI * cutoffHz);
+}
+
+float highPassCoeff(float cutoffHz, float fs) {
+  return fs / (fs + 2.0f * PI * cutoffHz);
+}
+
+float dcBlock1(float x) {
+  float y = x - dc1_x1 + dcR * dc1_y1;
+  dc1_x1 = x;
+  dc1_y1 = y;
+  return y;
+}
+
+float dcBlock2(float x) {
+  float y = x - dc2_x1 + dcR * dc2_y1;
+  dc2_x1 = x;
+  dc2_y1 = y;
+  return y;
+}
+
+// gentle, fast saturator
+float softClip(float x) {
+  if (x > 1.5f) x = 1.5f;
+  if (x < -1.5f) x = -1.5f;
+  return x * (27.0f + x * x) / (27.0f + 9.0f * x * x);
+}
+
+// very light compressor for spoken voice
+float compressSample(float x) {
+  float level = fabsf(x);
+
+  if (level > compEnv) {
+    compEnv += compAttack * (level - compEnv);
+  } else {
+    compEnv += compRelease * (level - compEnv);
   }
 
-  Serial.println("rawSignal rawNoise cleaned");
+  float gain = 1.0f;
+  if (compEnv > compThreshold) {
+    float desired = compThreshold + (compEnv - compThreshold) / compRatio;
+    gain = desired / compEnv;
+  }
+
+  return x * gain;
+}
+
+int16_t processVoiceSample(int32_t raw) {
+  // 1) Convert 32-bit I2S slot to useful sample
+  float x = (float)(raw >> 14);
+
+  // 2) Noise gate
+  if (x < noiseGate && x > -noiseGate) {
+    x = 0.0f;
+  }
+
+  // 3) Mic gain
+  x *= micGain;
+
+  // 4) Remove DC before normalization
+  x = dcBlock1(x);
+
+  // 5) Normalize to [-1, 1] roughly
+  float xn = x / 32768.0f;
+
+  // 6) Remove low rumble / handling noise
+  float hp = hpA * (hp_y1 + xn - hp_x1);
+  hp_x1 = xn;
+  hp_y1 = hp;
+
+  // 7) Bass / body
+  bassLP += bassAlpha * (hp - bassLP);
+  float body = hp + bassBoost * bassLP;
+
+  // 8) Remove muddy low-mid band
+  mudLP += mudAlpha * (body - mudLP);
+  float mudBand = mudLP - bassLP;         // approx low-mid region
+  float cleaned = body - mudCut * mudBand;
+
+  // 9) Add presence / clarity
+  presLP += presAlpha * (cleaned - presLP);
+  float presenceBand = cleaned - presLP;  // upper content
+  float voiced = cleaned + presenceBoost * presenceBand;
+
+  // 10) Add 2nd harmonic (warmth) using asymmetry
+  float evenGen = softClip((voiced + 0.35f * voiced * voiced) * evenDrive)
+                  - softClip(voiced * evenDrive);
+
+  // 11) Add 3rd harmonic (serious density)
+  float oddGen = voiced * voiced * voiced;
+
+  float harmonicVoice = voiced + evenMix * evenGen + oddMix * oddGen;
+
+  // 12) Remove DC again because even-harmonic generation can add offset
+  harmonicVoice = dcBlock2(harmonicVoice);
+
+  // 13) Light compression for stable narration feel
+  harmonicVoice = compressSample(harmonicVoice);
+
+  // 14) Final drive / cinematic thickness
+  float y = softClip(harmonicVoice * finalDrive);
+
+  // 15) Final trim
+  y *= outputGain;
+
+  // 16) Clamp
+  if (y > 1.0f) y = 1.0f;
+  if (y < -1.0f) y = -1.0f;
+
+  return (int16_t)(y * 32767.0f);
+}
+
+void setupI2SMic() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = 44100,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = MIC_CHANNEL_FORMAT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pin_config);
+  i2s_zero_dma_buffer(I2S_PORT);
+
+  const float fs = 44100.0f;
+  bassAlpha = onePoleAlpha(bassCutoffHz, fs);
+  mudAlpha  = onePoleAlpha(mudCutoffHz, fs);
+  presAlpha = onePoleAlpha(presenceHz, fs);
+  hpA       = highPassCoeff(rumbleCutHz, fs);
+}
+
+void micTask(void *param) {
+  const int BLOCK_SAMPLES = 256;
+  int32_t rawSamples[BLOCK_SAMPLES];
+  size_t bytesRead = 0;
+
+  while (true) {
+    esp_err_t result = i2s_read(
+                         I2S_PORT,
+                         (void *)rawSamples,
+                         sizeof(rawSamples),
+                         &bytesRead,
+                         portMAX_DELAY
+                       );
+
+    if (result == ESP_OK && bytesRead > 0) {
+      int count = bytesRead / sizeof(int32_t);
+
+      for (int i = 0; i < count; i++) {
+        int16_t s = processVoiceSample(rawSamples[i]);
+        pushSample(s);
+      }
+    }
+  }
+}
+
+// A2DP callback: must provide stereo 16-bit PCM
+int32_t get_audio_data(uint8_t *data, int32_t len) {
+  int16_t *out = (int16_t *)data;
+  int frames = len / 4;  // 4 bytes per stereo frame
+
+  for (int i = 0; i < frames; i++) {
+    int16_t s = popSample();
+
+    // same mono sample to L + R
+    out[2 * i]     = s;
+    out[2 * i + 1] = s;
+  }
+
+  return frames * 4;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("Starting I2S mic...");
+  setupI2SMic();
+
+  xTaskCreatePinnedToCore(
+    micTask,
+    "MicTask",
+    4096,
+    NULL,
+    1,
+    NULL,
+    1
+  );
+
+  Serial.println("Starting Bluetooth A2DP source...");
+  a2dp_source.set_auto_reconnect(true);
+  a2dp_source.set_volume(127);
+  a2dp_source.set_data_callback(get_audio_data);
+  a2dp_source.start(speaker_name);
+
+  Serial.println("Ready. Put your Bluetooth device in pairing mode.");
 }
 
 void loop() {
-  static uint32_t nextSample = micros();
-
-  if ((int32_t)(micros() - nextSample) < 0) {
-    return;
-  }
-  nextSample += SAMPLE_PERIOD_US;
-
-  // Read both microphones
-  int rawSignal = analogRead(MIC_SIGNAL_PIN);
-  int rawNoise  = analogRead(MIC_NOISE_PIN);
-
-  // Remove DC / slow offset
-  dcSignal += DC_ALPHA * ((float)rawSignal - dcSignal);
-  dcNoise  += DC_ALPHA * ((float)rawNoise  - dcNoise);
-
-  float d = (float)rawSignal - dcSignal;  // desired + noise
-  float x = (float)rawNoise  - dcNoise;   // reference noise
-
-  // Shift noise history
-  for (int i = TAPS - 1; i > 0; i--) {
-    xHist[i] = xHist[i - 1];
-  }
-  xHist[0] = x;
-
-  // Estimate correlated noise from reference mic
-  float yhat = 0.0f;
-  float power = 1.0f;
-  for (int i = 0; i < TAPS; i++) {
-    yhat  += w[i] * xHist[i];
-    power += xHist[i] * xHist[i];
-  }
-
-  // Residual = cleaned signal
-  float e = d - yhat;
-
-  // NLMS update
-  float step = MU / power;
-  for (int i = 0; i < TAPS; i++) {
-    w[i] = LEAK * w[i] + step * e * xHist[i];
-  }
-
-  // Soft limit for viewing/output
-  if (e > 1400.0f) e = 1400.0f;
-  if (e < -1400.0f) e = -1400.0f;
-
-#if USE_DAC_OUTPUT
-  // Classic ESP32 DAC is 8-bit, center at midscale
-  int dacValue = (int)(e * 0.09f) + 128;
-  if (dacValue < 0) dacValue = 0;
-  if (dacValue > 255) dacValue = 255;
-  dacWrite(DAC_PIN, dacValue);
-#endif
-
-  // Send slower data to Serial Plotter
-  static uint8_t plotDivider = 0;
-  plotDivider++;
-  if (plotDivider >= 8) {
-    plotDivider = 0;
-
-    int cleanedPlot = (int)e + 2048;
-    if (cleanedPlot < 0) cleanedPlot = 0;
-    if (cleanedPlot > 4095) cleanedPlot = 4095;
-
-    Serial.print(rawSignal);
-    Serial.print(' ');
-    Serial.print(rawNoise);
-    Serial.print(' ');
-    Serial.println(cleanedPlot);
-  }
+  delay(10);
 }
